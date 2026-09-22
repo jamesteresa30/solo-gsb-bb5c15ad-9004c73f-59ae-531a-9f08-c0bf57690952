@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import licenses as lic
 from . import policies as pol
@@ -234,6 +234,48 @@ def _split_ref(ref: str) -> Tuple[str, str]:
     return ref, ""
 
 
+def build_reference_resolver(packages) -> Callable[[str], Optional[str]]:
+    """根据包列表构建引用解析器：``name`` / ``name@version`` → 唯一包 key。
+
+    与 ``build_graph`` 内部的解析规则一致：带版本时精确匹配；
+    同名包仅一个版本时可省略版本；多版本且无法确定时返回 None。
+    ``packages`` 接受解析后的 :class:`Pkg` 列表或含 name/version 的字典列表。
+    """
+    index: Dict[str, str] = {}
+    by_name: Dict[str, List[str]] = {}
+
+    def _key_of(item) -> Tuple[str, str, str]:
+        if isinstance(item, Pkg):
+            return item.name, item.version, item.key
+        name = str(item.get("name", "")).strip()
+        version = str(item.get("version") or "").strip() or "0.0.0"
+        return name, version, f"{name}@{version}"
+
+    for item in packages:
+        name, version, key = _key_of(item)
+        if not name:
+            continue
+        index[key] = key
+        by_name.setdefault(name, [])
+        if key not in by_name[name]:
+            by_name[name].append(key)
+
+    def resolve(ref: str) -> Optional[str]:
+        name, version = _split_ref(ref)
+        if not name:
+            return None
+        if version:
+            exact = f"{name}@{version}"
+            if exact in index:
+                return exact
+        candidates = by_name.get(name, [])
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    return resolve
+
+
 def _validate_project_license(chosen_license: str, policy: pol.Policy, where: str) -> None:
     if chosen_license not in lic.KNOWN_LICENSES:
         raise ManifestError(f"{where}许可证 {chosen_license!r} 不在内置矩阵中")
@@ -255,19 +297,7 @@ def build_graph(data: dict, policy: pol.Policy, license_override: Optional[str] 
     edges: Dict[str, List[str]] = {p.key: [] for p in pkgs}
     unresolved: List[str] = []
 
-    def resolve(ref: str) -> Optional[str]:
-        name, version = _split_ref(ref)
-        if version:
-            exact = f"{name}@{version}"
-            if exact in index:
-                return exact
-        candidates = by_name.get(name, [])
-        if len(candidates) == 1:
-            return candidates[0]
-        if len(candidates) > 1:
-            # 多版本且引用未指定/未命中：无法确定，作为未解析引用
-            return None
-        return None
+    resolve = build_reference_resolver(pkgs)
 
     def add_unresolved(ref: str) -> None:
         if ref not in unresolved:

@@ -14,6 +14,11 @@ JSON 清单，选择项目许可策略后，系统解析完整**传递依赖图*
 * **审查版本对比**：选择两个已保存项目（基线 → 当前），按 `name@version` 对齐依赖结果，
   报告新增 / 移除依赖、许可证或结论（触发规则）变化；每个**新增冲突**给出当前制品、
   触发规则与当前最短依赖路径；多制品清单按同名制品分别对比；
+* **依赖裁剪试算（只读模拟）**：在已保存项目详情中勾选一条或多条
+  "父包 → 子包" 依赖边，基于**原清单临时移除**所选边后重新计算可达性与许可结论；
+  多制品项目按各制品根分别计算，报告每个制品**被消除 / 仍存在的冲突**、因失去全部路径
+  而**不再纳入审查的包**及每项变化前后的最短路径；同一包仍可经其他路径到达时**不会误报
+  已消除**。试算不写回清单、策略、例外或数据库，支持一键清空方案；
 * **JSON 报告导出**：一键下载完整审查报告（多制品时含分制品明细）。
 
 > ⚠️ 内置矩阵覆盖 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL-2.1 / LGPL-3.0 /
@@ -233,6 +238,55 @@ Content-Type: application/json
 
 ---
 
+## 依赖裁剪试算（只读 what-if）
+
+在**已保存项目**的详情页底部"依赖裁剪试算"卡片中，勾选一条或多条
+`父包 → 子包` 依赖边（支持全选 / 全不选），点击"发起只读试算"即可模拟
+"如果不再通过这些边引入依赖"后的审查结论：
+
+* **后端先校验边真实存在**：每条边都必须是原清单解析后的依赖图中实际存在的边
+  （合并声明的重复包、`name` / `name@version` 引用均按原解析规则定位）；
+  父包 / 子包不存在、边不存在或同一条边重复提交均返回 400；
+* **基于原清单临时移除后重算**：不改动保存的清单，只在内存中的临时副本上移除所选边，
+  重新执行 BFS 可达性遍历并按项目**保存时的策略与已确认例外**重新判定许可结论；
+* **多制品项目按各制品根分别计算**：每个制品只统计从自己的根可达的包；
+  只在部分制品下失去路径的包，只影响对应制品；在所有制品下都失去路径时才进入
+  `newly_unreachable_packages`；
+* **逐制品给出变化前后的最短路径**：
+  * **被消除的冲突**：该制品下试算前为 `deny` / `review`，试算后因**失去全部路径**
+    而不可达；
+  * **仍存在的冲突**：裁剪后仍可达且仍为冲突——即使原路径被裁，只要同一包**仍可经其他
+    路径到达**就只列在本节并给出新的最短路径，**绝不会误报为已消除**；
+  * **不再纳入审查的包**：该制品下从可达变为不可达的全部包（含原本兼容的包）；
+  * **最短路径变化**：仍可达、但 BFS 最短路径与试算前不同的包（可能改走其他路径）；
+  * 多制品报告额外给出**跨制品总览变化**（最严重结论 / 可达制品集合变化）；
+* **隐式根冻结**：未声明 `direct_dependencies` 的单制品清单，其根（入度为 0 的包）
+  在试算中保持不变，避免删除唯一入边后子包被错误地"晋升"为新根；
+* **一键清空方案**：点击"一键清空方案"（或全不选）即清除勾选与试算结果，回到原始审查视图。
+
+试算是纯只读操作：**不会写回**清单、策略、例外，也不写数据库；重新打开项目或切换
+策略 / 确认例外后，旧试算方案自动失效。
+
+### 试算 API
+
+```
+POST /api/projects/{id}/pruning-sim
+Content-Type: application/json
+
+{"edges": [{"from": "web框架@2.3.1", "to": "网络内核@3.1.0"},
+           {"from": "rpc工具包@5.0.0", "to": "网络内核@3.1.0"}]}
+```
+
+返回 `licensegate-pruning/v1` 报告：`read_only: true`、`removed_edges`、总览 `summary`
+（`eliminated_conflicts` / `remaining_conflicts` / `dropped_packages` /
+`changed_paths` / `conflicts_before` / `conflicts_after` / `newly_unreachable`）、
+`newly_unreachable_packages`、逐制品 `scopes[]`（每项含四类变化清单与每项的
+`before_shortest_path` / `after_shortest_path`）、多制品时的 `overview` 总览变化，
+以及完整的 `baseline` / `simulated` 两份标准审查结果。`edges` 可为空（等价于不裁剪）；
+项目不存在返回 404，边不合法返回 400。
+
+---
+
 ## 许可策略
 
 策略在兼容矩阵之上叠加两层规则：
@@ -265,6 +319,7 @@ Content-Type: application/json
 | `DELETE` | `/api/projects/{id}/exceptions/{package_id}` | 撤销例外，自动重新计算；多制品模式需带查询参数 `?distribution=制品名` |
 | `DELETE` | `/api/projects/{id}` | 删除项目 |
 | `POST` | `/api/compare` | 审查版本对比（body：`{"baseline_id": 旧ID, "current_id": 新ID}`），按 `name@version` 对齐，新增冲突含当前制品 / 触发规则 / 最短路径 |
+| `POST` | `/api/projects/{id}/pruning-sim` | 依赖裁剪只读试算（body：`{"edges": [{"from": "父@ver", "to": "子@ver"}]}`）：校验边存在后基于原清单临时移除并重算，逐制品给出消除/仍存在冲突、不再纳入审查的包与变化前后最短路径，不写回任何数据 |
 | `GET` | `/api/projects/{id}/export` | 下载 JSON 报告（`license-report-{id}.json`），多制品时含 `distributions` 分制品明细与总览 |
 | `GET` | `/api/policies` · `/api/licenses` · `/api/health` | 元数据 |
 
@@ -285,12 +340,13 @@ Content-Type: application/json
 │   ├── main.py        # FastAPI 路由与静态页
 │   ├── analyzer.py    # 清单解析、依赖图、BFS 最短路径、环检测、单/多制品冲突分析
 │   ├── compare.py     # 审查版本对比：按 name@version 对齐两份结果，逐制品报告差异与新增冲突
+│   ├── pruning.py     # 依赖裁剪只读试算：校验/临时移除依赖边后重算，逐制品报告冲突消除与路径变化
 │   ├── licenses.py    # SPDX 规范化、表达式解析、兼容性矩阵
 │   ├── policies.py    # 四种许可策略与判定叠加规则
 │   └── db.py          # SQLite 持久化（项目 + 按 (包,规则) 维度的例外，含旧库迁移）
-├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换、总览与版本对比）
+├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换、总览、版本对比与裁剪试算）
 ├── examples/          # 示例清单（manifest.example.json 单制品 / manifest.multi.example.json 多制品）
-├── tests/             # 75 个单元/接口测试（含多制品引擎、版本对比引擎与端到端用例）
+├── tests/             # 85 个单元/接口测试（含多制品引擎、版本对比、裁剪试算与端到端用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

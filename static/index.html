@@ -131,6 +131,29 @@
   .cmp-scope .aff.exception { border-left-color:var(--violet); background:var(--violet-bg); }
   .cmp-scope .aff.allow { border-left-color:var(--green); background:var(--green-bg); }
   table h3 { font-size:14px; }
+  .prune-edge-list { max-height:240px; overflow-y:auto; border:1px solid var(--line); border-radius:8px;
+    padding:8px 10px; background:#fafbff; display:flex; flex-direction:column; gap:2px; }
+  .prune-edge-list label { display:flex; gap:8px; align-items:center; font-weight:400; font-size:12.5px;
+    padding:3px 4px; border-radius:5px; cursor:pointer; }
+  .prune-edge-list label:hover { background:#eef2ff; }
+  .prune-edge-list .arrow { color:var(--muted); }
+  .prune-banner { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:13px;
+    background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:10px 14px; margin-bottom:14px; }
+  .prune-banner .mono { background:#fff; border:1px solid #bbf7d0; border-radius:5px; padding:2px 8px; }
+  .prune-scope { border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  .prune-scope h3 { margin:0 0 8px; font-size:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .prune-scope .prune-scope-stats { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  .prune-empty { font-size:12px; color:var(--muted); padding:6px 2px; }
+  .prune table th, .prune table td { font-size:12.5px; }
+  .prune .path { background:#fff; border:1px solid var(--line); }
+  .prune .path-after { background:#f0fdf4; border-color:#bbf7d0; }
+  .prune .path-before { background:var(--gray-bg); }
+  .prune-section-head { font-size:13px; font-weight:700; margin:12px 0 6px; display:flex; gap:8px; align-items:center; }
+  .prune-section-head .count { font-weight:700; border-radius:999px; font-size:11px; padding:1px 9px;
+    background:var(--gray-bg); color:var(--muted); }
+  .prune-section-head .count.red { background:var(--red-bg); color:var(--red); }
+  .prune-section-head .count.green { background:var(--green-bg); color:var(--green); }
+  .prune-section-head .count.amber { background:var(--amber-bg); color:var(--amber); }
   @media (max-width:820px){ .stats{grid-template-columns:repeat(3,1fr)} .field{min-width:140px} }
 </style>
 </head>
@@ -322,6 +345,31 @@
         </div>
       </details>
     </div>
+
+    <!-- 依赖裁剪试算（只读） -->
+    <div class="card">
+      <h2 class="section-title">4. 依赖裁剪试算 <span class="hint" style="font-weight:400">（只读模拟，不写回清单 / 策略 / 例外 / 数据库）</span></h2>
+      <div class="hint" style="margin-bottom:10px">
+        勾选一条或多条 <code class="mono">父包 → 子包</code> 依赖边，模拟"如果不再通过这些边引入依赖"后的审查结果：
+        系统基于<strong>原清单临时移除所选边</strong>后重新计算可达性与许可结论，多制品项目按各制品根分别计算。
+        同一包若仍可经其他路径到达，只会显示最短路径变化，<strong>不会被误报为已消除</strong>。
+      </div>
+      <div class="toolbar">
+        <button id="pruneAllBtn" class="ghost" type="button">全选</button>
+        <button id="pruneNoneBtn" class="ghost" type="button">全不选</button>
+        <span style="flex:1"></span>
+        <button id="pruneRunBtn" type="button" disabled>发起只读试算</button>
+        <button id="pruneClearBtn" class="ghost danger" type="button" style="display:none">一键清空方案</button>
+      </div>
+      <div id="pruneEdgeList" class="prune-edge-list"></div>
+
+      <div id="pruneResults" class="hidden" style="margin-top:16px">
+        <div id="pruneBanner" class="prune-banner"></div>
+        <div class="stats" id="pruneStats" style="margin-bottom:16px"></div>
+        <div id="pruneOverviewChanges"></div>
+        <div id="pruneScopes"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -503,6 +551,7 @@ function render(data){
 
   if(multi) renderMulti(data);
   else renderSingle(data);
+  renderPrunePanel(data);
 }
 
 function renderChips(data){
@@ -1015,6 +1064,298 @@ function renderCmpDetails(d){
       <td>→</td>
       <td><span class="lic-tag">${esc(r.current_license||"未声明")}</span></td>
     </tr>`).join("");
+}
+
+// ===========================================================================
+// 依赖裁剪试算（只读 what-if）
+// ===========================================================================
+let pruneResult = null;
+let pruneAppliedEdges = [];   // 最近一次试算实际使用的边
+let pruneChecked = new Set();   // "from to"
+let pruneEdgeSig = "";
+let pruneDataRef = null;
+
+function edgeKey(e){ return e.from + " " + e.to; }
+
+function currentPruneEdges(){
+  return [...pruneChecked].map(k=>{
+    const i = k.indexOf(" ");
+    return {from: k.slice(0,i), to: k.slice(i+1)};
+  });
+}
+
+function pruneSelectionStale(){
+  if(!pruneResult) return false;
+  const applied = pruneAppliedEdges.map(edgeKey).sort().join(";");
+  return [...pruneChecked].sort().join(";") !== applied;
+}
+
+function renderPrunePanel(data){
+  const edges = data.edges || [];
+  const listEl = $("#pruneEdgeList");
+
+  // 上传 / 切换项目 / 例外变更 / 重算都会产生新的 data 对象：旧试算与勾选失效；
+  // 仅切换多制品标签时 render 收到同一对象，保留试算与勾选。
+  const newBaseline = data !== pruneDataRef;
+  if(newBaseline){
+    pruneDataRef = data;
+    pruneResult = null;
+    pruneAppliedEdges = [];
+    pruneChecked = new Set();
+    pruneEdgeSig = "";
+    $("#pruneResults").classList.add("hidden");
+  }
+  const sig = (data.project_id || data.project.name) + "|" + edges.map(edgeKey).join(";");
+  if(sig !== pruneEdgeSig){
+    pruneEdgeSig = sig;
+    if(!edges.length){
+      listEl.innerHTML = '<div class="prune-empty">该清单的依赖图没有任何依赖边，无需裁剪。</div>';
+    }else{
+      listEl.innerHTML = edges.map(e=>`
+        <label title="${esc(e.from)} → ${esc(e.to)}">
+          <input type="checkbox" data-from="${esc(e.from)}" data-to="${esc(e.to)}">
+          <span class="mono">${esc(e.from)}</span>
+          <span class="arrow">→</span>
+          <span class="mono">${esc(e.to)}</span>
+        </label>`).join("");
+      listEl.querySelectorAll("input[type=checkbox]").forEach(cb=>{
+        cb.addEventListener("change", ()=>{
+          const k = cb.dataset.from + " " + cb.dataset.to;
+          if(cb.checked) pruneChecked.add(k); else pruneChecked.delete(k);
+          updatePruneButtons();
+          refreshPruneStale();
+        });
+      });
+    }
+  }
+  // 重建复选框勾选态（sig 未变但 DOM 可能因新结果重渲染——此处 DOM 未动，保持即可）
+  listEl.querySelectorAll("input[type=checkbox]").forEach(cb=>{
+    cb.checked = pruneChecked.has(cb.dataset.from + " " + cb.dataset.to);
+  });
+  updatePruneButtons();
+}
+
+function updatePruneButtons(){
+  $("#pruneRunBtn").disabled = pruneChecked.size === 0;
+  const showClear = pruneResult !== null || pruneChecked.size > 0;
+  $("#pruneClearBtn").style.display = showClear ? "" : "none";
+  $("#pruneAllBtn").disabled = !(currentResult.edges || []).length;
+}
+
+// 勾选变化后，若试算结果正在展示，仅刷新横幅上的"结果已过期"提示
+function refreshPruneStale(){
+  if(pruneResult && !$("#pruneResults").classList.contains("hidden")){
+    renderPruneResult(pruneResult);
+  }
+}
+
+$("#pruneAllBtn").addEventListener("click", ()=>{
+  document.querySelectorAll("#pruneEdgeList input[type=checkbox]").forEach(cb=>{
+    cb.checked = true;
+    pruneChecked.add(cb.dataset.from + " " + cb.dataset.to);
+  });
+  updatePruneButtons();
+  refreshPruneStale();
+});
+$("#pruneNoneBtn").addEventListener("click", ()=>{ clearPruneSelection(); });
+
+function clearPruneSelection(){
+  pruneChecked = new Set();
+  pruneResult = null;
+  pruneAppliedEdges = [];
+  document.querySelectorAll("#pruneEdgeList input[type=checkbox]").forEach(cb=>{ cb.checked = false; });
+  $("#pruneResults").classList.add("hidden");
+  updatePruneButtons();
+}
+
+$("#pruneClearBtn").addEventListener("click", clearPruneSelection);
+
+$("#pruneRunBtn").addEventListener("click", async ()=>{
+  if(!currentProjectId || !pruneChecked.size) return;
+  clearError();
+  const edges = currentPruneEdges();
+  $("#pruneRunBtn").disabled = true;
+  try{
+    pruneResult = await api(`/api/projects/${currentProjectId}/pruning-sim`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({edges})
+    });
+    pruneAppliedEdges = edges;
+    renderPruneResult(pruneResult);
+  }catch(e){ showError(e.message); }
+  finally { $("#pruneRunBtn").disabled = pruneChecked.size === 0; }
+});
+
+function renderPathBlock(label, path, depth, cls){
+  return `<div class="hint" style="margin-top:4px">${label}（深度 ${depth??"—"}）</div>
+    <div class="path mono ${cls}">${renderPath(path)}</div>`;
+}
+
+function renderPruneResult(d){
+  $("#pruneResults").classList.remove("hidden");
+  const s = d.summary;
+  const staleHtml = pruneSelectionStale()
+    ? `<span class="chip warn">⚠ 勾选已变化，当前结果对应旧方案，请重新点击"发起只读试算"</span>`
+    : "";
+  $("#pruneBanner").innerHTML =
+    `<span>🔎 <strong>只读试算结果</strong></span>
+     <span class="hint">本次模拟不写回清单、策略、例外或数据库</span>
+     ${staleHtml}
+     <span style="flex:1"></span>
+     <span class="hint">临时移除 ${s.edges_removed} 条边：</span>` +
+    d.removed_edges.map(e=>`<span class="mono">${esc(e.from)} → ${esc(e.to)}</span>`).join("");
+
+  $("#pruneStats").innerHTML = [
+    [s.eliminated_conflicts,"被消除冲突","deny"],
+    [s.remaining_conflicts,"仍存在冲突","review"],
+    [s.dropped_packages,"不再纳入审查（包×制品）","allow"],
+    [s.changed_paths,"最短路径变化","review"],
+    [s.newly_unreachable,"新增不可达包（图级）","allow"],
+    [`${s.conflicts_before}→${s.conflicts_after}`,"未处理冲突 前→后",""],
+  ].map(([n,l,c])=>{
+    const cls = c==="deny" ? "deny" : c==="allow" ? "allow" : c==="review" ? "review" : "";
+    return `<div class="stat ${cls}"><div class="num">${n}</div><div class="lbl">${l}</div></div>`;
+  }).join("");
+
+  $("#pruneOverviewChanges").innerHTML = d.overview ? renderPruneOverview(d.overview) : "";
+  $("#pruneScopes").innerHTML = d.scopes.map(sc=>renderPruneScope(sc, d.mode==="multi")).join("");
+  updatePruneButtons();
+  $("#pruneResults").scrollIntoView({behavior:"smooth", block:"start"});
+}
+
+const PRUNE_CHANGE_TEXT = {
+  conflict_cleared:"冲突已清除（跨制品聚合）", verdict_changed:"最严重结论变化",
+  reachability_changed:"可达制品变化", dropped:"对所有制品不可达",
+};
+
+function renderPruneOverview(ov){
+  const rows = ov.changes || [];
+  return `<div class="prune-scope">
+    <h3>跨制品总览变化
+      <span class="hint">未处理冲突 ${ov.summary.conflicts_before} → ${ov.summary.conflicts_after}；
+      全制品不可达包 ${ov.summary.unreachable_before} → ${ov.summary.unreachable_after}</span></h3>
+    <div style="overflow-x:auto"><table class="prune">
+      <thead><tr><th style="width:170px">包 / 版本</th><th style="width:150px">裁剪前 → 裁剪后结论</th>
+        <th>可达制品变化</th><th style="width:170px">变化类型</th></tr></thead>
+      <tbody>${rows.map(r=>`
+        <tr>
+          <td class="mono">${esc(r.id)}</td>
+          <td>${badge(r.before_verdict)} → ${r.after_verdict==="unreachable"
+              ? '<span class="mini na">不可达</span>' : badge(r.after_verdict)}</td>
+          <td><div class="hint">前：${r.reachable_distributions_before.length
+              ? r.reachable_distributions_before.map(esc).join("、") : "（无）"}</div>
+            <div class="hint">后：${r.reachable_distributions_after.length
+              ? r.reachable_distributions_after.map(esc).join("、") : "（无，全部失去路径）"}</div></td>
+          <td><span class="reason ${r.change==="conflict_cleared"||r.change==="dropped"?"no_longer_reachable":"changed"}">
+            ${PRUNE_CHANGE_TEXT[r.change]||r.change}</span></td>
+        </tr>`).join("") ||
+        '<tr><td colspan="4" class="prune-empty">跨制品总览无变化。</td></tr>'}
+      </tbody></table></div>
+  </div>`;
+}
+
+function pruneSection(title, count, cls, bodyHtml){
+  return `<div class="prune-section-head">${title}<span class="count ${cls}">${count}</span></div>
+    <div style="overflow-x:auto"><table class="prune">${bodyHtml}</table></div>`;
+}
+
+function distCell(v, multi){
+  return multi ? `<td>${v ? `<span class="chip info">${esc(v)}</span>` : '<span class="hint">—</span>'}</td>` : "";
+}
+
+function renderPruneScope(sc, multi){
+  const distTh = multi ? "<th style='width:100px'>制品</th>" : "";
+  // 1. 被消除的冲突
+  const eliminated = pruneSection(
+    "被消除的冲突（该制品下失去全部路径，不再构成问题）", sc.eliminated_conflicts.length,
+    sc.eliminated_conflicts.length ? "green" : "",
+    `<thead><tr><th style="width:160px">包 / 版本</th>${distTh}
+       <th style="width:120px">许可证</th><th>试算前结论 / 规则 / 最短路径</th><th style="width:110px">试算后</th></tr></thead>
+     <tbody>${sc.eliminated_conflicts.map(r=>`
+       <tr>
+         <td><strong>${esc(r.name)}</strong><div class="hint mono">${esc(r.version)}</div></td>
+         ${distCell(r.distribution, multi)}
+         <td><span class="lic-tag">${esc(r.license_raw||"未声明")}</span></td>
+         <td>${badge(r.verdict)}
+           <div class="rule" style="margin-top:4px">触发规则：<code>${esc(r.rule)}</code></div>
+           ${renderPathBlock("试算前最短路径", r.before_shortest_path, r.before_depth, "path-before")}
+         </td>
+         <td><span class="mini na">该制品不可达</span></td>
+       </tr>`).join("") ||
+       '<tr><td colspan="5" class="prune-empty">没有因裁剪而被消除的冲突；仍为问题的包见下表。</td></tr>'}
+     </tbody>`);
+
+  // 2. 仍存在的冲突（仍可经其他路径到达，不误报）
+  const remaining = pruneSection(
+    "仍存在的冲突（仍可经其他路径到达，未被消除）", sc.remaining_conflicts.length,
+    sc.remaining_conflicts.length ? "red" : "",
+    `<thead><tr><th style="width:160px">包 / 版本</th>${distTh}
+       <th style="width:120px">许可证</th><th>试算后结论 / 规则</th>
+       <th>试算前 → 试算后最短路径</th></tr></thead>
+     <tbody>${sc.remaining_conflicts.map(r=>`
+       <tr>
+         <td><strong>${esc(r.name)}</strong><div class="hint mono">${esc(r.version)}</div></td>
+         ${distCell(r.distribution, multi)}
+         <td><span class="lic-tag">${esc(r.license_raw||"未声明")}</span></td>
+         <td>${badge(r.verdict)}
+           <div class="rule" style="margin-top:4px"><code>${esc(r.rule)}</code></div>
+           <div class="msg">${esc(r.message||"")}</div></td>
+         <td>${renderPathBlock("试算前", r.before_shortest_path, r.before_depth, "path-before")}
+             ${renderPathBlock("试算后", r.after_shortest_path, r.after_depth, "path-after")}</td>
+       </tr>`).join("") ||
+       '<tr><td colspan="5" class="prune-empty">🎉 裁剪后该制品没有仍存在的冲突。</td></tr>'}
+     </tbody>`);
+
+  // 3. 不再纳入审查的包
+  const dropped = pruneSection(
+    "因失去全部路径而不再纳入审查的包", sc.dropped_packages.length,
+    sc.dropped_packages.length ? "amber" : "",
+    `<thead><tr><th style="width:160px">包 / 版本</th>${distTh}
+       <th style="width:120px">许可证</th><th style="width:110px">试算前结论</th>
+       <th>试算前最短路径 → 试算后</th></tr></thead>
+     <tbody>${sc.dropped_packages.map(r=>`
+       <tr>
+         <td><strong>${esc(r.name)}</strong><div class="hint mono">${esc(r.version)}</div></td>
+         ${distCell(r.distribution, multi)}
+         <td><span class="lic-tag">${esc(r.license_raw||"未声明")}</span></td>
+         <td>${badge(r.verdict)}${r.exception?'<div class="hint">（已确认例外）</div>':""}</td>
+         <td>${renderPathBlock("试算前", r.before_shortest_path, r.before_depth, "path-before")}
+           <div class="hint" style="margin-top:4px">试算后：<span class="mini na">该制品不可达</span></div></td>
+       </tr>`).join("") ||
+       '<tr><td colspan="5" class="prune-empty">没有包因裁剪而失去全部路径。</td></tr>'}
+     </tbody>`);
+
+  // 4. 最短路径变化（仍可达，避免误报）
+  const changed = pruneSection(
+    "最短路径发生变化的包（仍可达，仅路径不同）", sc.changed_paths.length,
+    sc.changed_paths.length ? "amber" : "",
+    `<thead><tr><th style="width:160px">包 / 版本</th>${distTh}
+       <th style="width:110px">试算后结论</th><th>试算前 → 试算后最短路径</th></tr></thead>
+     <tbody>${sc.changed_paths.map(r=>`
+       <tr>
+         <td><strong>${esc(r.name)}</strong><div class="hint mono">${esc(r.version)}</div></td>
+         ${distCell(r.distribution, multi)}
+         <td>${badge(r.verdict)}</td>
+         <td>${renderPathBlock("试算前", r.before_shortest_path, r.before_depth, "path-before")}
+             ${renderPathBlock("试算后", r.after_shortest_path, r.after_depth, "path-after")}</td>
+       </tr>`).join("") ||
+       '<tr><td colspan="4" class="prune-empty">仍可达的包最短路径均未变化。</td></tr>'}
+     </tbody>`);
+
+  const title = multi
+    ? `制品「${esc(sc.name)}」<span class="lic-tag">项目许可证 ${esc(sc.project_license||"")}</span>`
+    : "审查结果";
+  return `<div class="prune-scope">
+    <h3>${title}</h3>
+    <div class="prune-scope-stats">
+      <span class="chip ${sc.summary.conflicts_after?"err":""}">未处理冲突：${sc.summary.conflicts_before} → ${sc.summary.conflicts_after}</span>
+      <span class="chip">审查包数：${sc.summary.total_before} → ${sc.summary.total_after}</span>
+      <span class="chip ${sc.summary.eliminated_conflicts?"info":""}">消除冲突 ${sc.summary.eliminated_conflicts}</span>
+      <span class="chip ${sc.summary.remaining_conflicts?"warn":""}">仍存在 ${sc.summary.remaining_conflicts}</span>
+      <span class="chip ${sc.summary.dropped_packages?"warn":""}">不再纳入审查 ${sc.summary.dropped_packages}</span>
+    </div>
+    ${eliminated}${remaining}${dropped}${changed}
+  </div>`;
 }
 
 init().catch(e=>showError("初始化失败："+e.message));

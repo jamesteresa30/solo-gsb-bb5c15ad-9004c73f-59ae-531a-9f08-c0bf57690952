@@ -4,14 +4,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
-from . import __version__, analyzer, compare, licenses, policies
+from . import __version__, analyzer, compare, licenses, policies, pruning
 from .db import Database, now_iso
 
 DB_PATH = os.environ.get("LICENSEGATE_DB", "/data/licensegate.db")
@@ -51,6 +51,21 @@ class ExceptionRequest(BaseModel):
 class CompareRequest(BaseModel):
     baseline_id: int = Field(..., description="基线（旧版本）项目 ID")
     current_id: int = Field(..., description="当前（新版本）项目 ID")
+
+
+class PruningEdge(BaseModel):
+    """一条待裁剪的"父包 → 子包"依赖边（均为 name@version）。"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(..., alias="from", min_length=1, description="父包 name@version")
+    to: str = Field(..., min_length=1, description="子包 name@version")
+
+
+class PruningRequest(BaseModel):
+    edges: List[PruningEdge] = Field(
+        default_factory=list,
+        description="要临时移除的依赖边列表（from/to 均为 name@version），可为空（不裁剪）",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +493,38 @@ def compare_projects(req: CompareRequest) -> dict:
         )
     except compare.CompareError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["generated_at"] = now_iso()
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 依赖裁剪试算（只读 what-if，不写回清单 / 策略 / 例外 / 数据库）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/projects/{project_id}/pruning-sim")
+def pruning_simulation(project_id: int, req: PruningRequest) -> dict:
+    """在已保存项目上临时移除选定依赖边后重新试算可达性与许可结论。
+
+    后端逐条校验边在原清单解析后的依赖图中确实存在；多制品清单按各制品
+    自己的根分别计算。试算结果包含被消除 / 仍存在的冲突、失去全部路径
+    而不再纳入审查的包，以及每项裁剪前后的最短路径。
+    """
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    policy = _resolve_policy(project["policy_key"])
+    exceptions = db.list_exceptions(project_id)
+    edges = [e.model_dump(by_alias=True) for e in req.edges]
+    try:
+        payload = pruning.simulate_pruning(
+            project["manifest"], policy, edges, exceptions
+        )
+    except pruning.PruningError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except analyzer.ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["project_id"] = project_id
     payload["generated_at"] = now_iso()
     return payload
 
