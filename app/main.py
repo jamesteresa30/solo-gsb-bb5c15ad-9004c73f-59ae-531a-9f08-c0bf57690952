@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, analyzer, compare, licenses, policies
+from . import __version__, analyzer, compare, licenses, policies, trial
 from .db import Database, now_iso
 
 DB_PATH = os.environ.get("LICENSEGATE_DB", "/data/licensegate.db")
@@ -51,6 +51,17 @@ class ExceptionRequest(BaseModel):
 class CompareRequest(BaseModel):
     baseline_id: int = Field(..., description="基线（旧版本）项目 ID")
     current_id: int = Field(..., description="当前（新版本）项目 ID")
+
+
+class TrialEdge(BaseModel):
+    from_: str = Field(..., alias="from", description="父包 name@version")
+    to: str = Field(..., description="子包 name@version")
+
+    model_config = {"populate_by_name": True}
+
+
+class TrialRequest(BaseModel):
+    edges: list[TrialEdge] = Field(..., min_length=1, description="要临时移除的依赖边（父包 → 子包）")
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +489,42 @@ def compare_projects(req: CompareRequest) -> dict:
         )
     except compare.CompareError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["generated_at"] = now_iso()
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 依赖裁剪模拟（只读试算）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/projects/{project_id}/trial")
+def trial_prune(project_id: int, req: TrialRequest) -> dict:
+    """依赖裁剪模拟：在原清单上临时移除所选依赖边后重算可达性与许可结论。
+
+    纯只读试算：不写回清单、策略、例外或数据库。多制品项目按各自根
+    分别计算，返回每个制品被消除 / 仍存在的冲突、失去全部路径的包，
+    以及每项变化前后的最短路径。
+    """
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    policy = _resolve_policy(project["policy_key"])
+    baseline = _analyze_project(project_id, policy, None)
+    edge_dicts = [e.model_dump(by_alias=True) for e in req.edges]
+    try:
+        payload = trial.simulate(
+            manifest=project["manifest"],
+            policy=policy,
+            baseline=baseline,
+            exceptions=db.list_exceptions(project_id),
+            edges=edge_dicts,
+        )
+    except trial.TrialError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except analyzer.ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["project_id"] = project_id
     payload["generated_at"] = now_iso()
     return payload
 

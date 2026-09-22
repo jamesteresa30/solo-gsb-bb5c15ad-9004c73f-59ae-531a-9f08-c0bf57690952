@@ -14,6 +14,10 @@ JSON 清单，选择项目许可策略后，系统解析完整**传递依赖图*
 * **审查版本对比**：选择两个已保存项目（基线 → 当前），按 `name@version` 对齐依赖结果，
   报告新增 / 移除依赖、许可证或结论（触发规则）变化；每个**新增冲突**给出当前制品、
   触发规则与当前最短依赖路径；多制品清单按同名制品分别对比；
+* **依赖裁剪模拟（只读试算）**：在已保存项目详情中勾选一条或多条"父包 → 子包"依赖边，
+  基于原清单临时移除这些边后重新计算可达性与许可结论；按制品给出被消除 / 仍存在的冲突、
+  因失去全部路径而不再纳入审查的包及每项变化前后的最短路径（仍可经其他路径到达的包不会误报），
+  全程不写回清单、策略、例外或数据库；
 * **JSON 报告导出**：一键下载完整审查报告（多制品时含分制品明细）。
 
 > ⚠️ 内置矩阵覆盖 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL-2.1 / LGPL-3.0 /
@@ -233,6 +237,59 @@ Content-Type: application/json
 
 ---
 
+## 依赖裁剪模拟（只读试算）
+
+在已保存项目详情页的"**依赖裁剪模拟**"卡片中，可以勾选一条或多条
+**父包 → 子包**依赖边（支持按包名过滤、只看冲突最短路径上的边、批量全选），
+点击"开始试算"后，后端基于**原清单**临时移除所选边并重新执行 BFS 可达性遍历与许可判定：
+
+* **被消除的冲突**：试算前为 `deny` / `review`（且未确认例外），裁剪后从该制品根不可达的包，
+  给出试算前结论、触发规则与最短路径；
+* **仍存在的冲突**：裁剪后仍可达的冲突包——即使原最短路径被切断，只要还能经**其他路径**
+  到达就保留在该列表（**不会误报为已消除**），并给出变化前后的两条最短路径；
+* **不再纳入审查的包**：因失去全部到达路径而不可达的包（含其下游整条子图），
+  其中非冲突包单独列在折叠区；
+* **路径变化**：仍可达、结论不变但最短路径改变的兼容包（例如改走另一条等价路径）。
+
+多制品清单**按各制品的根分别计算**：只有从某制品根出发经过被裁剪边的可达性会变化，
+其他制品结果不受影响；页面提供"总览 / 各制品"切换。直接依赖（根）集合在试算中固定不变，
+不会因为某条边被删、某个包入度归零而把它误当成新的根。
+
+统计区给出每个作用域的试算前冲突数、仍存在 / 被消除冲突数、不再审查包数、路径变化数与
+试算后可达包总数。
+
+试算是**纯只读**操作：不写回清单、策略、例外，也不写数据库；"一键清空方案"按钮可清除全部
+勾选并隐藏试算结果，重新加载项目时方案也会重置。
+
+### 试算 API
+
+```
+POST /api/projects/{id}/trial
+Content-Type: application/json
+
+{"edges": [{"from": "网络内核@3.1.0", "to": "加密原语@2.0.0"}]}
+```
+
+返回 `licensegate-trial/v1` 报告：
+
+| 字段 | 说明 |
+| --- | --- |
+| `mode` | `single` / `multi` |
+| `removed_edges` | 实际移除的边（请求中的重复边去重、保持顺序） |
+| `summary` | 跨制品汇总：`baseline_conflicts` / `remaining_conflicts` / `resolved_conflicts` / `dropped_packages` / `path_changed` |
+| `scopes[]` | 单制品为一个 `name: null` 的作用域；多制品时每个制品一个 section（含自己的 `roots`、`project_license`、`summary` 与四类明细） |
+| `scopes[].resolved_conflicts[]` | 被消除冲突：试算前结论 `baseline_verdict`、规则 `baseline_rule`、路径 `baseline_shortest_path` |
+| `scopes[].remaining_conflicts[]` | 仍存在冲突：`baseline_shortest_path` 与 `trimmed_shortest_path`，`path_changed` 标记路径是否改变 |
+| `scopes[].dropped_packages[]` | 失达包（含非冲突包，`was_conflict` 标记其试算前是否为冲突） |
+| `scopes[].path_changed[]` | 仍可达且结论不变、但最短路径改变的包 |
+| `unreachable_packages` | 多制品模式：裁剪后对任何制品都不可达的包 |
+| `read_only` | 恒为 `true` |
+
+所选边必须真实存在于清单解析后的依赖图中（以 `name@version` 精确到包版本），
+任一边不存在返回 400 并列出非法边；未选择边返回 422；项目不存在返回 404。
+
+---
+
 ## 许可策略
 
 策略在兼容矩阵之上叠加两层规则：
@@ -265,6 +322,7 @@ Content-Type: application/json
 | `DELETE` | `/api/projects/{id}/exceptions/{package_id}` | 撤销例外，自动重新计算；多制品模式需带查询参数 `?distribution=制品名` |
 | `DELETE` | `/api/projects/{id}` | 删除项目 |
 | `POST` | `/api/compare` | 审查版本对比（body：`{"baseline_id": 旧ID, "current_id": 新ID}`），按 `name@version` 对齐，新增冲突含当前制品 / 触发规则 / 最短路径 |
+| `POST` | `/api/projects/{id}/trial` | 依赖裁剪模拟（只读试算，body：`{"edges":[{"from":"父@ver","to":"子@ver"}]}`），返回被消除 / 仍存在冲突、失达包与变化前后最短路径，不写回任何数据 |
 | `GET` | `/api/projects/{id}/export` | 下载 JSON 报告（`license-report-{id}.json`），多制品时含 `distributions` 分制品明细与总览 |
 | `GET` | `/api/policies` · `/api/licenses` · `/api/health` | 元数据 |
 
@@ -285,12 +343,13 @@ Content-Type: application/json
 │   ├── main.py        # FastAPI 路由与静态页
 │   ├── analyzer.py    # 清单解析、依赖图、BFS 最短路径、环检测、单/多制品冲突分析
 │   ├── compare.py     # 审查版本对比：按 name@version 对齐两份结果，逐制品报告差异与新增冲突
+│   ├── trial.py       # 依赖裁剪模拟：临时移除所选边后按各制品根重算，对比前后冲突与最短路径
 │   ├── licenses.py    # SPDX 规范化、表达式解析、兼容性矩阵
 │   ├── policies.py    # 四种许可策略与判定叠加规则
 │   └── db.py          # SQLite 持久化（项目 + 按 (包,规则) 维度的例外，含旧库迁移）
-├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换、总览与版本对比）
+├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换、总览、版本对比与裁剪试算）
 ├── examples/          # 示例清单（manifest.example.json 单制品 / manifest.multi.example.json 多制品）
-├── tests/             # 75 个单元/接口测试（含多制品引擎、版本对比引擎与端到端用例）
+├── tests/             # 91 个单元/接口测试（含多制品引擎、版本对比、裁剪试算与端到端用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
