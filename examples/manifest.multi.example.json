@@ -1,0 +1,73 @@
+{
+  "project": {
+    "name": "example-monorepo",
+    "version": "3.0.0"
+  },
+  "packages": [
+    {
+      "name": "sdk-main",
+      "version": "3.0.0",
+      "license": "MIT",
+      "dependencies": ["json工具@1.0.0", "网络内核@3.1.0"]
+    },
+    {
+      "name": "cli-main",
+      "version": "3.0.0",
+      "license": "GPL-3.0",
+      "dependencies": ["json工具@1.0.0", "读取行库@1.4.0"]
+    },
+    {
+      "name": "service-main",
+      "version": "3.0.0",
+      "license": "AGPL-3.0",
+      "dependencies": ["网络内核@3.1.0", "json工具@1.0.0"]
+    },
+    {
+      "name": "json工具",
+      "version": "1.0.0",
+      "license": "(MIT OR Apache-2.0)",
+      "dependencies": []
+    },
+    {
+      "name": "网络内核",
+      "version": "3.1.0",
+      "license": "LGPL-3.0",
+      "dependencies": ["加密原语@2.0.0"]
+    },
+    {
+      "name": "加密原语",
+      "version": "2.0.0",
+      "license": "GPL-3.0",
+      "dependencies": []
+    },
+    {
+      "name": "读取行库",
+      "version": "1.4.0",
+      "license": "GPL-2.0",
+      "dependencies": []
+    },
+    {
+      "name": "实验模块",
+      "version": "0.1.0",
+      "license": "Some-Custom-License",
+      "dependencies": []
+    }
+  ],
+  "distributions": [
+    {
+      "name": "sdk-mpl",
+      "project_license": "MPL-2.0",
+      "direct_dependencies": ["sdk-main"]
+    },
+    {
+      "name": "cli-gpl3",
+      "project_license": "GPL-3.0",
+      "direct_dependencies": ["cli-main"]
+    },
+    {
+      "name": "service-agpl",
+      "project_license": "AGPL-3.0",
+      "direct_dependencies": ["service-main", "不存在的包@9.9.9"]
+    }
+  ]
+}

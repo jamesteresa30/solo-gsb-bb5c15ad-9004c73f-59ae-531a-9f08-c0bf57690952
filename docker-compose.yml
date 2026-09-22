@@ -1,0 +1,16 @@
+services:
+  licensegate:
+    build: .
+    image: licensegate:latest
+    container_name: licensegate
+    ports:
+      - "${LICENSEGATE_PORT:-8000}:8000"
+    volumes:
+      - licensegate-data:/data
+    environment:
+      # SQLite 数据库文件位置（容器内路径，挂载到命名卷持久化）
+      LICENSEGATE_DB: /data/licensegate.db
+    restart: unless-stopped
+
+volumes:
+  licensegate-data:

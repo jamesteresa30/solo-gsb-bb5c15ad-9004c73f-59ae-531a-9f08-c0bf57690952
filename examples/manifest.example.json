@@ -1,0 +1,58 @@
+{
+  "project": {
+    "name": "example-saas-backend",
+    "version": "1.4.0"
+  },
+  "project_license": "MIT",
+  "direct_dependencies": ["web框架", "rpc工具包"],
+  "packages": [
+    {
+      "name": "web框架",
+      "version": "2.3.1",
+      "license": "MIT",
+      "dependencies": ["json工具@1.0.0", "日志库@0.9.2"]
+    },
+    {
+      "name": "rpc工具包",
+      "version": "5.0.0",
+      "license": "Apache-2.0",
+      "dependencies": ["json工具@1.0.0", "网络内核@3.1.0", "读取行库@1.4.0"]
+    },
+    {
+      "name": "json工具",
+      "version": "1.0.0",
+      "license": "(MIT OR Apache-2.0)",
+      "dependencies": []
+    },
+    {
+      "name": "日志库",
+      "version": "0.9.2",
+      "license": "BSD-3-Clause",
+      "dependencies": []
+    },
+    {
+      "name": "网络内核",
+      "version": "3.1.0",
+      "license": "LGPL-3.0",
+      "dependencies": ["加密原语@2.0.0"]
+    },
+    {
+      "name": "加密原语",
+      "version": "2.0.0",
+      "license": "GPL-3.0",
+      "dependencies": []
+    },
+    {
+      "name": "读取行库",
+      "version": "1.4.0",
+      "license": "GPL-2.0",
+      "dependencies": []
+    },
+    {
+      "name": "内部工具",
+      "version": "0.1.0",
+      "license": "Some-Custom-License",
+      "dependencies": []
+    }
+  ]
+}
